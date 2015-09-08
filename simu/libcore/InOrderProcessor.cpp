@@ -44,6 +44,9 @@
 #include "GMemorySystem.h"
 #include "ClusterManager.h"
 
+std::map<AddrType, size_t> InOrderProcessor::readList;
+std::map<AddrType, size_t> InOrderProcessor::writeList;
+
 InOrderProcessor::InOrderProcessor(GMemorySystem *gm, CPU_t i)
   :GProcessor(gm, i, 1)
   ,IFID(i, gm)
@@ -51,6 +54,9 @@ InOrderProcessor::InOrderProcessor(GMemorySystem *gm, CPU_t i)
   ,lsq(i,32768)
   ,rROB(SescConf->getInt("cpusimu", "robSize", i))
   ,clusterManager(gm, this)
+  ,scType(SescConf->getBool("cpusimu", "sequentiallyConsistent") ? (SescConf->getBool("cpusimu", "conflictOrder") ? CONFLICT_ORDER : NAIVE) : NONE)
+  ,conflicts("P(%d)_ExeEngine:nConflicts", i)
+  ,nonConflictingMemoryOperations("P(%d)_ExeEngine:nNonConflictingMemoryOperations", i)
 {/*{{{*/
 
   uint32_t maxwarps = SescConf->getInt("cpuemul", "max_warps_sm", i);
@@ -196,6 +202,49 @@ StallCause InOrderProcessor::addInst(DInst *dinst)
   if( (ROB.size()+rROB.size()) >= MaxROBSize )
     return SmallROBStall;
 
+  switch (scType) {
+    case NAIVE:
+    {
+      const FastQueue<DInst *> * const queues[] = {&ROB, &rROB};
+
+      for (size_t i = 0; i < sizeof(queues) / sizeof(*queues); i++) {
+        const size_t queueSize = queues[i]->size();
+
+        for (size_t j = 0; j < queueSize; j++) {
+          const Instruction * const instructionInFlight = queues[i]->getData(queues[i]->getIDFromTop(j))->getInst();
+
+          if (instructionInFlight->isLoad() || instructionInFlight->isStore() || instructionInFlight->getOpcode() == iSALU_LL)
+            return ReplaysStall;
+        }
+      }
+
+      break;
+    }
+    case CONFLICT_ORDER:
+      if (inst->isLoad() || inst->isStore() || inst->getOpcode() == iSALU_LL) {
+        if (writeList.find(dinst->getAddr()) != writeList.end() ||
+            inst->isStore() && readList.find(dinst->getAddr()) != readList.end()) {
+          if (conflictingInstructions.find(dinst) == conflictingInstructions.end()) {
+            conflictingInstructions.insert(dinst);
+            conflicts.inc();
+          }
+          else
+            (void) dinst;
+
+          return ReplaysStall;
+        }
+
+        if (conflictingInstructions.find(dinst) == conflictingInstructions.end())
+          nonConflictingMemoryOperations.inc();
+        else
+          conflictingInstructions.erase(dinst);
+      }
+
+      break;
+    default:
+      break;
+  }
+
   Cluster *cluster = dinst->getCluster();
   if( !cluster ) {
     Resource *res = clusterManager.getResource(dinst);
@@ -215,6 +264,13 @@ StallCause InOrderProcessor::addInst(DInst *dinst)
   nInst[inst->getOpcode()]->inc(dinst->getStatsFlag()); // FIXME: move to cluster
 
   ROB.push(dinst);
+
+  if (scType == CONFLICT_ORDER) {
+    if (inst->isLoad() || inst->getOpcode() == iSALU_LL)
+      ++readList[dinst->getAddr()];
+    else if (inst->isStore())
+      ++writeList[dinst->getAddr()];
+  }
 
   if( !dinst->isSrc2Ready() ) {
     // It already has a src2 dep. It means that it is solved at
@@ -316,6 +372,21 @@ void InOrderProcessor::retire()
          );
 
 #endif
+
+    if (scType == CONFLICT_ORDER) {
+      const Instruction * const inst = dinst->getInst();
+      std::map<AddrType, size_t> * const memoryOperationList =
+        inst->isLoad() || inst->getOpcode() == iSALU_LL ? &readList : (inst->isStore() ? &writeList : NULL);
+
+      if (memoryOperationList) {
+        I((*memoryOperationList)[dinst->getAddr()] > 0);
+
+        if ((*memoryOperationList)[dinst->getAddr()] == 1)
+          memoryOperationList->erase(dinst->getAddr());
+        else
+          --(*memoryOperationList)[dinst->getAddr()];
+      }
+    }
 
     dinst->destroy(eint);
     rROB.pop();

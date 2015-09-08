@@ -44,6 +44,16 @@
 
 class InOrderProcessor : public GProcessor {
 private:
+  static std::map<AddrType, size_t> readList;
+  static std::map<AddrType, size_t> writeList;
+
+  enum SequentialConsistencyType {NONE, NAIVE, CONFLICT_ORDER};
+
+  const SequentialConsistencyType scType;
+  GStatsCntr conflicts;
+  GStatsCntr nonConflictingMemoryOperations;
+  std::set<DInst *> conflictingInstructions;
+
   FetchEngine IFID;
   PipeQueue   pipeQ;
   int32_t     spaceInInstQueue;
